@@ -1,0 +1,473 @@
+import { ElkLayoutArguments } from "elkjs/lib/elk-api";
+// import forceLayout from "graphology-layout-force";
+import forceAtlas2 from "graphology-layout-forceatlas2";
+import { FC, useEffect, useMemo, useRef, useState } from "react";
+import ReactFlow, {
+  Edge,
+  MiniMap,
+  Node,
+  NodeTypes,
+  OnSelectionChangeParams,
+  useEdgesState,
+  useNodesState,
+  useReactFlow,
+  useStore,
+  XYPosition,
+} from "reactflow";
+
+import { BackendResponse } from "../data/backend";
+import { Graph, toFlowElements } from "../data/frontend";
+import { FindRelatedNodes } from "../data/selectors";
+import {
+  runNodesInnerPosition,
+  runEdgesPositionning,
+} from "../layout/inner_position";
+import * as layout from "../layout/layout";
+import ActionBar from "./ActionBar";
+import Drawer from "./Drawer";
+import { CustomEdge } from "./edgeComponents";
+import {
+  Machine,
+  NetworkInterface,
+  Region,
+  Service,
+  Subnetwork,
+} from "./nodeComponents";
+
+const nodeTypes: NodeTypes = {
+  machine: Machine,
+  network_interface: NetworkInterface,
+  service: Service,
+  subnetwork: Subnetwork,
+  region: Region,
+};
+
+const edgeTypes = {
+  custom: CustomEdge,
+};
+
+const Canvas: FC<{ data: BackendResponse }> = (props) => {
+  const canvasData = useMemo<any>(() => {
+    const data = toFlowElements(props.data);
+    return data;
+  }, [props.data]);
+
+  const graph: Graph<any> = {
+    nodes: canvasData.nodes,
+    edges: canvasData.edges,
+  };
+
+  // STATES
+  const [nodes, setNodes, onNodesChange] = useNodesState(graph.nodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(graph.edges);
+  const [initialLayout, setInitialLayout] = useState(false);
+  const initialRender = useRef(true);
+  const [copyOfNodes, setCopyOfNodes] = useNodesState([...nodes]);
+  const [copyOfEdges, setCopyOfEdges] = useEdgesState([...edges]);
+  const [showDrawer, setShowDrawer] = useState(false);
+  const [selectedNodes, setSelectedNodes] = useState<any>(null);
+
+  // ====================================================================== //
+  // LAYOUT FUNCTIONS ===================================================== //
+  // ====================================================================== //
+
+  // === INNER LAYOUT FUNCTION ===  //
+  const innerLayout = () => {
+    // Run MachineLayout
+    setNodes((nodes: Array<Node<any>>): Array<Node<any>> => {
+      return runNodesInnerPosition(nodes);
+    });
+    // Fix ZIndex to send machine to background
+    setNodes((nodes: Node<any>[]): Node<any>[] => {
+      return nodes.map((node) => {
+        if (node.type === "machine" || node.type === "subnetwork") {
+          node.draggable = true;
+          node = {
+            ...node,
+            style: {
+              width: node.style?.width,
+              height: node.style?.height,
+              zIndex: 0,
+            },
+          };
+          return node;
+        } else {
+          node.draggable = false;
+          node = {
+            ...node,
+            style: {
+              width: node.style?.width,
+              height: node.style?.height,
+              zIndex: 1,
+            },
+          };
+          return node;
+        }
+      });
+    });
+    // Fix ZIndex to Edges to have them on first layer
+    setEdges((edges: Array<Edge<any>>): Array<Edge<any>> => {
+      const newEdges = runEdgesPositionning(nodes, edges);
+      newEdges.map((edge) => {
+        edge.type = "custom";
+        edge.style = {
+          ...edge.style,
+          zIndex: 1,
+          width: 5,
+          stroke: "green",
+          strokeWidth: 2,
+        };
+        edge.animated = true;
+      });
+      return newEdges;
+    });
+  };
+  // ----------------------------- //
+
+  const randomLayout = (scale: number) => {
+    setNodes((nodes: Node<any>[]): Node<any>[] => {
+      return nodes.map((n) => {
+        return {
+          ...n,
+          position: { x: scale * Math.random(), y: scale * Math.random() },
+        };
+      });
+    });
+  };
+
+  const elkLayoutForce = async (
+    args?: ElkLayoutArguments
+  ): Promise<Graph<any>> => {
+    const root = await layout.elk(graph, {
+      layoutOptions: {
+        "elk.algorithm": "force", // "rectpacking", "force", "box", "disco", "layered", "fixed", "sporeCompaction", "sporeOverlap"
+        "spacing.nodeNode": "5", // Default 20
+        "force.iterations": "300", // Default 300 && fait lagguer
+        "force.repulsivePower": "0", // Default 0 && fait lagguer
+      },
+    });
+
+    const nodesId = nodes.map((node) => {
+      return node.id;
+    });
+
+    // store the positions
+    let mapping: { [id: string]: XYPosition } = {};
+    // top level nodes
+    root.children?.forEach((node) => {
+      mapping[node.id] = {
+        x: node.x ? node.x : 0,
+        y: node.y ? node.y : 0,
+      };
+
+      // children nodes
+      node.children?.forEach((node2) => {
+        mapping[node2.id] = {
+          x: node2.x ? node2.x : 0,
+          y: node2.y ? node2.y : 0,
+        };
+      });
+    });
+
+    // // Create an array with positionned Machines & subnetwork and add it with all others nodes not positionned
+    const positionnedSubnAndMachId = root.children?.map((node) => node.id);
+
+    // now update back nodes
+    setNodes((nodes: Node<any>[]): Node<any>[] => {
+      return nodes.map((n) => {
+        if (positionnedSubnAndMachId?.includes(n.id)) {
+          const newNode = {
+            ...n,
+            position: mapping[n.id],
+          };
+          return newNode;
+        } else {
+          return n;
+        }
+      });
+    });
+
+    return graph;
+  };
+
+  const elkLayoutBox = async (
+    args?: ElkLayoutArguments
+  ): Promise<Graph<any>> => {
+    const root = await layout.elk(graph, {
+      layoutOptions: {
+        "elk.algorithm": "box", // "rectpacking", "force", "box", "disco", "layered", "fixed", "sporeCompaction", "sporeOverlap"
+        "spacing.nodeNode": "50", // Default 20
+        "force.iterations": "500", // Default 300 && fait lagguer
+        "force.repulsivePower": "0", // Default 0 && fait lagguer
+      },
+    });
+
+    const nodesId = nodes.map((node) => {
+      return node.id;
+    });
+
+    // store the positions
+    let mapping: { [id: string]: XYPosition } = {};
+    // top level nodes
+    root.children?.forEach((node) => {
+      mapping[node.id] = {
+        x: node.x ? node.x : 0,
+        y: node.y ? node.y : 0,
+      };
+
+      // children nodes
+      node.children?.forEach((node2) => {
+        mapping[node2.id] = {
+          x: node2.x ? node2.x : 0,
+          y: node2.y ? node2.y : 0,
+        };
+      });
+    });
+
+    // // Create an array with positionned Machines & subnetwork and add it with all others nodes not positionned
+    const positionnedSubnAndMachId = root.children?.map((node) => node.id);
+
+    // now update back nodes
+    setNodes((nodes: Node<any>[]): Node<any>[] => {
+      return nodes.map((n) => {
+        if (positionnedSubnAndMachId?.includes(n.id)) {
+          const newNode = {
+            ...n,
+            position: mapping[n.id],
+          };
+          return newNode;
+        } else {
+          return n;
+        }
+      });
+    });
+    return graph;
+  };
+
+  const graphologyLayout = () => {
+    // the following function only transform
+    // the input graph into graphology
+    // the algorithm is run after
+    const gg = layout.graphologySimple(graph);
+
+    // layout algorithm
+    // let positions = forceLayout(gg, {
+    //   maxIterations: 5000,
+    //   settings: {
+    //     repulsion: 100,
+    //     attraction: 100,
+    //     inertia: 0.9,
+    //     maxMove: 500,
+    //   },
+    // });
+    let positions = forceAtlas2(gg, {
+      iterations: 500,
+      settings: {
+        adjustSizes: true,
+        gravity: 1,
+      },
+    });
+    // let positions = circular(gg, {scale: 10});
+
+    // now update back nodes
+    setNodes((nodes: Node<any>[]): Node<any>[] => {
+      return nodes.map((n) => {
+        return {
+          ...n,
+          position: {
+            x: positions[n.id] ? positions[n.id].x : n.position.x,
+            y: positions[n.id] ? positions[n.id].y : n.position.y,
+          },
+        };
+      });
+    });
+  };
+
+  // ====================================================================== //
+  // END OF LAYOUT FUNCTIONS ============================================== //
+  // ====================================================================== //
+
+  // HINT: It runs only on first rendering. Otherwise it would create an infinite loop (not detected by React)
+  useEffect(() => {
+    if (initialRender.current && !initialLayout) {
+      elkLayoutForce().then(() => {
+        innerLayout();
+        setInitialLayout(true);
+        initialRender.current = false;
+        setCopyOfNodes(nodes);
+      });
+    }
+  }, []);
+
+  // showEdge on click
+  const onSelectionChange = ({ nodes, edges }: OnSelectionChangeParams) => {
+    // Reset opacity if no nodes are selected
+    if (nodes.length === 0) {
+      setNodes((nodes) => {
+        return nodes.map((node) => {
+          node.style = {
+            ...node.style,
+            opacity: 1,
+          };
+          return node;
+        });
+      });
+      setEdges((edges) => {
+        return edges.map((edge) => {
+          edge.hidden = true;
+          return edge;
+        });
+      });
+      setShowDrawer(false);
+    }
+
+    // Actions on first render
+    if (initialRender.current) {
+      // 1. hide all edges
+      setEdges((edges) => {
+        return edges.map((edge) => {
+          edge.hidden = true;
+          return edge;
+        });
+      });
+
+      // 2.Create Edges toward machines in case machines are into selection
+      const machineNodes = copyOfNodes.filter(
+        (node) => node.type === "machine"
+      );
+      machineNodes.map((machineNode) => {
+        const childNodes = copyOfNodes.filter(
+          (copyOfNode) =>
+            copyOfNode.parentNode === machineNode.id &&
+            copyOfNode.type === "network_interface"
+        );
+        const childNodesId = childNodes.map((node) => node.id);
+        const relatedNode = copyOfEdges
+          .filter((edge) => childNodesId.includes(edge.target))
+          .map((edge) => {
+            return edge.source;
+          });
+        console.log("🚀 ~ relatedNode", relatedNode);
+
+        setEdges((edges) => {
+          const extraEdges = relatedNode.map((node) => {
+            const edge = {
+              animated: true,
+              hidden: true,
+              style: { stroke: "green", strokeWidth: 4, width: 10, zIndex: 1 },
+              id: `${node} -> ${machineNode.id} - Artificial`,
+              source: node,
+              target: machineNode.id,
+              type: "smoothstep",
+            };
+            return edge;
+          });
+          const uniqueObjects = [
+            ...new Map(
+              extraEdges.map((extraEdge) => [extraEdge.id, extraEdge])
+            ).values(),
+          ];
+
+          const newSetofEdge = [...edges, ...uniqueObjects];
+          return newSetofEdge;
+        });
+      });
+    }
+
+    // Set opacity on selected Nodes and hidden true on Edges connected
+    if (!initialRender.current && nodes.length > 0) {
+      // 1.Find out the nodes to select.
+
+      const nodesToHighlight = FindRelatedNodes(nodes, edges, copyOfNodes);
+      console.log("🚀 ~ nodesToHighlight", nodesToHighlight);
+
+      //2. Reduce opacity for not selected Nodes
+      setNodes((nodes) => {
+        return nodes.map((node) => {
+          if (nodesToHighlight.includes(node.id)) {
+            node.style = {
+              ...node.style,
+              opacity: 1,
+            };
+            return node;
+          } else {
+            node.style = {
+              ...node.style,
+              opacity: 0.3,
+            };
+            return node;
+          }
+        });
+      });
+
+      //4.Reveal edges connected the selected Nodes
+      setEdges((edges) => {
+        const selectedNodesId = nodesToHighlight.map((nodeToHighlight) => {
+          const foundNode = copyOfNodes.find(
+            (element: any) => element.id === nodeToHighlight
+          );
+          if (foundNode) return foundNode.id;
+        });
+        return edges.map((edge) => {
+          if (
+            selectedNodesId.includes(edge.source) ||
+            selectedNodesId.includes(edge.target)
+          ) {
+            return (edge = {
+              ...edge,
+              hidden: false,
+            });
+          } else {
+            return (edge = {
+              ...edge,
+              hidden: true,
+            });
+          }
+        });
+      });
+    }
+
+    if (nodes.length > 0) {
+      setShowDrawer(true);
+    }
+
+    setSelectedNodes(nodes);
+  };
+
+  // React flow instance needed to fitView after first render
+  const reactFlowInstance = useReactFlow();
+  useEffect(() => {
+    reactFlowInstance.fitView({ padding: 10, includeHiddenNodes: false });
+  }, [initialLayout]);
+  console.log("🚀 ~ edges", edges);
+  console.log("🚀 ~ nodes", nodes);
+  return (
+    <div className="w-full h-full ">
+      <ReactFlow
+        fitView={true}
+        onSelectionChange={onSelectionChange}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
+        nodesDraggable={true}
+        panOnScroll={true}
+        minZoom={0.2}
+        maxZoom={5}
+        defaultZoom={3}
+        elementsSelectable={true}
+        style={{ backgroundColor: "white" }}
+      >
+        <ActionBar layoutBox={elkLayoutBox} layoutForce={elkLayoutForce} />
+        {selectedNodes && showDrawer ? <Drawer nodes={selectedNodes} /> : null}
+
+        <MiniMap />
+        {/* <Controls showZoom={true} /> */}
+      </ReactFlow>
+    </div>
+  );
+};
+
+export default Canvas;
